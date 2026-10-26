@@ -1,7 +1,6 @@
 """Views for Employee Leave Management API endpoints."""
-from django.db import transaction
-from django.shortcuts import get_object_or_404
-from django.utils import timezone
+from __future__ import annotations
+
 from rest_framework import generics, status
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -14,6 +13,29 @@ from modules.elm.models import (
     LeaveBalance,
     LeaveType,
 )
+from modules.elm.selectors.applications import (
+    approval_queue,
+    visible_applications,
+    visible_balances,
+)
+from modules.elm.services.application_service import (
+    apply_leave,
+    nominate_replacement_substitute,
+    respond_substitute,
+    review_leave,
+    withdraw_leave,
+)
+from modules.elm.services.cancellation_service import (
+    request_cancellation,
+    review_cancellation,
+)
+from modules.elm.services.extension_service import request_extension
+from modules.elm.services.offline_leave_service import record_offline_sanctioned_leave
+from modules.elm.services.resumption_service import (
+    review_duty_resumption,
+    submit_duty_resumption,
+)
+from modules.elm.services.rollover_service import execute_year_end_rollover
 
 MODULE_GATE = HasModuleGrant("leave_elm")
 
@@ -21,6 +43,15 @@ MODULE_GATE = HasModuleGrant("leave_elm")
 def _principal_user_id(request) -> int:
     principal = getattr(request, "principal", None)
     return int(getattr(principal, "user_id", getattr(principal, "id", 0)) or 0)
+
+
+def _is_director(request) -> bool:
+    principal = getattr(request, "principal", None)
+    if not principal:
+        return False
+    roles = getattr(principal, "roles", ()) or ()
+    active_role = getattr(principal, "active_role", "") or ""
+    return "Director" in roles or active_role == "Director"
 
 
 class LeaveTypeListView(generics.ListAPIView):
@@ -32,15 +63,23 @@ class LeaveTypeListView(generics.ListAPIView):
 class LeaveBalanceListView(generics.ListAPIView):
     serializer_class = s.LeaveBalanceSerializer
     permission_classes = [MODULE_GATE, HasPermission("leave_elm.balance.view")]
+    queryset = LeaveBalance.objects.none()
 
     def get_queryset(self):
-        return LeaveBalance.objects.filter(
-            user_id=_principal_user_id(self.request)
-        ).select_related("leave_type")
+        if getattr(self, "swagger_fake_view", False):
+            return LeaveBalance.objects.none()
+        target_uid = self.request.query_params.get("user_id")
+        year = self.request.query_params.get("year")
+        uid_int = int(target_uid) if target_uid and target_uid.isdigit() else None
+        year_int = int(year) if year and year.isdigit() else None
+        return visible_balances(
+            self.request.principal, target_user_id=uid_int, year=year_int
+        )
 
 
 class LeaveApplicationListCreateView(generics.ListCreateAPIView):
     serializer_class = s.LeaveApplicationSerializer
+    queryset = LeaveApplication.objects.none()
 
     def get_permissions(self):
         if self.request.method == "POST":
@@ -48,27 +87,31 @@ class LeaveApplicationListCreateView(generics.ListCreateAPIView):
         return [MODULE_GATE(), HasPermission("leave_elm.application.view")()]
 
     def get_queryset(self):
-        return LeaveApplication.objects.filter(
-            user_id=_principal_user_id(self.request)
-        ).select_related("leave_type")
+        if getattr(self, "swagger_fake_view", False):
+            return LeaveApplication.objects.none()
+        return visible_applications(self.request.principal)
 
-    @transaction.atomic
     def create(self, request, *args, **kwargs):
         inp = s.LeaveApplicationCreateSerializer(data=request.data)
         inp.is_valid(raise_exception=True)
         data = inp.validated_data
-        leave_type = get_object_or_404(
-            LeaveType, code=data.pop("leave_type_code"), is_active=True
-        )
-        app = LeaveApplication.objects.create(
-            user_id=_principal_user_id(request),
-            leave_type=leave_type,
-            **data,
-        )
-        return Response(
-            s.LeaveApplicationSerializer(app).data,
-            status=status.HTTP_201_CREATED,
-        )
+        try:
+            app = apply_leave(
+                user_id=_principal_user_id(request),
+                leave_type_code=data["leave_type_code"],
+                start_date=data["start_date"],
+                end_date=data["end_date"],
+                half_day=data.get("half_day", False),
+                station_leave=data.get("station_leave", False),
+                station_address=data.get("station_address", ""),
+                reason=data.get("reason", ""),
+                substitute_user_id=data.get("substitute_user_id"),
+                is_director=_is_director(request),
+            )
+        except ValueError as err:
+            return Response({"detail": str(err)}, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response(s.LeaveApplicationSerializer(app).data, status=status.HTTP_201_CREATED)
 
 
 class LeaveWithdrawView(APIView):
@@ -78,55 +121,14 @@ class LeaveWithdrawView(APIView):
         HasPermission("leave_elm.application.withdraw"),
     ]
 
-    @transaction.atomic
     def post(self, request, pk: int):
-        app = get_object_or_404(
-            LeaveApplication, pk=pk, user_id=_principal_user_id(request)
-        )
-        if app.status == "pending":
-            app.status = "withdrawn"
-            app.save(update_fields=["status", "updated_at"])
-        return Response(s.LeaveApplicationSerializer(app).data)
-
-
-class LeaveApprovalQueueView(generics.ListAPIView):
-    serializer_class = s.LeaveApplicationSerializer
-    permission_classes = [
-        MODULE_GATE,
-        HasPermission("leave_elm.application.approve"),
-    ]
-
-    def get_queryset(self):
-        return LeaveApplication.objects.filter(
-            status__in=["pending", "recommended"]
-        ).select_related("leave_type")
-
-
-class LeaveApprovalDecisionView(APIView):
-    serializer_class = s.LeaveDecisionSerializer
-    permission_classes = [
-        MODULE_GATE,
-        HasPermission("leave_elm.application.approve"),
-    ]
-
-    @transaction.atomic
-    def post(self, request, pk: int):
-        app = get_object_or_404(LeaveApplication, pk=pk)
-        inp = s.LeaveDecisionSerializer(data=request.data)
-        inp.is_valid(raise_exception=True)
-        app.status = inp.validated_data["decision"]
-        app.review_remarks = inp.validated_data.get("remarks", "")
-        app.reviewer_user_id = _principal_user_id(request)
-        app.decided_at = timezone.now()
-        app.save(
-            update_fields=[
-                "status",
-                "review_remarks",
-                "reviewer_user_id",
-                "decided_at",
-                "updated_at",
-            ]
-        )
+        try:
+            app = withdraw_leave(
+                application_id=pk,
+                applicant_user_id=_principal_user_id(request),
+            )
+        except ValueError as err:
+            return Response({"detail": str(err)}, status=status.HTTP_400_BAD_REQUEST)
         return Response(s.LeaveApplicationSerializer(app).data)
 
 
@@ -137,18 +139,249 @@ class SubstituteResponseView(APIView):
         HasPermission("leave_elm.substitute.respond"),
     ]
 
-    @transaction.atomic
     def post(self, request, pk: int):
-        app = get_object_or_404(
-            LeaveApplication,
-            pk=pk,
-            substitute_user_id=_principal_user_id(request),
-        )
         inp = s.SubstituteDecisionSerializer(data=request.data)
         inp.is_valid(raise_exception=True)
-        app.substitute_status = inp.validated_data["status"]
-        app.save(update_fields=["substitute_status", "updated_at"])
+        decision = inp.validated_data["decision"]
+        try:
+            app = respond_substitute(
+                application_id=pk,
+                substitute_user_id=_principal_user_id(request),
+                decision=decision,
+                is_director=_is_director(request),
+            )
+        except ValueError as err:
+            return Response({"detail": str(err)}, status=status.HTTP_400_BAD_REQUEST)
         return Response(s.LeaveApplicationSerializer(app).data)
+
+
+class SubstituteReplacementView(APIView):
+    serializer_class = s.SubstituteReplacementSerializer
+    permission_classes = [
+        MODULE_GATE,
+        HasPermission("leave_elm.application.apply"),
+    ]
+
+    def post(self, request, pk: int):
+        inp = s.SubstituteReplacementSerializer(data=request.data)
+        inp.is_valid(raise_exception=True)
+        try:
+            app = nominate_replacement_substitute(
+                application_id=pk,
+                applicant_user_id=_principal_user_id(request),
+                substitute_user_id=inp.validated_data["substitute_user_id"],
+            )
+        except ValueError as err:
+            return Response({"detail": str(err)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(s.LeaveApplicationSerializer(app).data)
+
+
+class LeaveApprovalQueueView(generics.ListAPIView):
+    serializer_class = s.LeaveApplicationSerializer
+    permission_classes = [
+        MODULE_GATE,
+        HasPermission("leave_elm.application.approve"),
+    ]
+    queryset = LeaveApplication.objects.none()
+
+    def get_queryset(self):
+        if getattr(self, "swagger_fake_view", False):
+            return LeaveApplication.objects.none()
+        return approval_queue(self.request.principal)
+
+
+class LeaveApprovalDecisionView(APIView):
+    serializer_class = s.LeaveDecisionSerializer
+    permission_classes = [
+        MODULE_GATE,
+        HasPermission("leave_elm.application.approve"),
+    ]
+
+    def post(self, request, pk: int):
+        inp = s.LeaveDecisionSerializer(data=request.data)
+        inp.is_valid(raise_exception=True)
+        decision = inp.validated_data["decision"]
+        remarks = inp.validated_data.get("remarks", "")
+        try:
+            app = review_leave(
+                application_id=pk,
+                reviewer_user_id=_principal_user_id(request),
+                decision=decision,
+                remarks=remarks,
+            )
+        except ValueError as err:
+            return Response({"detail": str(err)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(s.LeaveApplicationSerializer(app).data)
+
+
+class LeaveCancellationRequestView(APIView):
+    serializer_class = s.LeaveCancellationRequestSerializer
+    permission_classes = [
+        MODULE_GATE,
+        HasPermission("leave_elm.application.cancel"),
+    ]
+
+    def post(self, request, pk: int):
+        inp = s.LeaveCancellationRequestSerializer(data=request.data)
+        inp.is_valid(raise_exception=True)
+        try:
+            app = request_cancellation(
+                application_id=pk,
+                applicant_user_id=_principal_user_id(request),
+                reason=inp.validated_data["reason"],
+            )
+        except ValueError as err:
+            return Response({"detail": str(err)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(s.LeaveApplicationSerializer(app).data)
+
+
+class LeaveCancellationDecisionView(APIView):
+    serializer_class = s.LeaveCancellationDecisionSerializer
+    permission_classes = [
+        MODULE_GATE,
+        HasPermission("leave_elm.cancellation.review"),
+    ]
+
+    def post(self, request, pk: int):
+        inp = s.LeaveCancellationDecisionSerializer(data=request.data)
+        inp.is_valid(raise_exception=True)
+        decision = inp.validated_data["decision"]
+        remarks = inp.validated_data.get("remarks", "")
+        try:
+            app = review_cancellation(
+                application_id=pk,
+                reviewer_user_id=_principal_user_id(request),
+                decision=decision,
+                remarks=remarks,
+            )
+        except ValueError as err:
+            return Response({"detail": str(err)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(s.LeaveApplicationSerializer(app).data)
+
+
+class LeaveExtensionCreateView(APIView):
+    serializer_class = s.LeaveExtensionCreateSerializer
+    permission_classes = [
+        MODULE_GATE,
+        HasPermission("leave_elm.extension.apply"),
+    ]
+
+    def post(self, request, pk: int):
+        inp = s.LeaveExtensionCreateSerializer(data=request.data)
+        inp.is_valid(raise_exception=True)
+        data = inp.validated_data
+        try:
+            app = request_extension(
+                original_application_id=pk,
+                applicant_user_id=_principal_user_id(request),
+                start_date=data["start_date"],
+                end_date=data["end_date"],
+                reason=data.get("reason", ""),
+                substitute_user_id=data.get("substitute_user_id"),
+            )
+        except ValueError as err:
+            return Response({"detail": str(err)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(s.LeaveApplicationSerializer(app).data, status=status.HTTP_201_CREATED)
+
+
+class DutyResumptionSubmitView(APIView):
+    serializer_class = s.DutyResumptionSubmitSerializer
+    permission_classes = [
+        MODULE_GATE,
+        HasPermission("leave_elm.resumption.submit"),
+    ]
+
+    def post(self, request, pk: int):
+        inp = s.DutyResumptionSubmitSerializer(data=request.data)
+        inp.is_valid(raise_exception=True)
+        data = inp.validated_data
+        try:
+            app = submit_duty_resumption(
+                application_id=pk,
+                user_id=_principal_user_id(request),
+                actual_resumption_date=data["actual_resumption_date"],
+                remarks=data.get("remarks", ""),
+            )
+        except ValueError as err:
+            return Response({"detail": str(err)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(s.LeaveApplicationSerializer(app).data)
+
+
+class DutyResumptionReviewView(APIView):
+    serializer_class = s.DutyResumptionReviewSerializer
+    permission_classes = [
+        MODULE_GATE,
+        HasPermission("leave_elm.resumption.review"),
+    ]
+
+    def post(self, request, pk: int):
+        inp = s.DutyResumptionReviewSerializer(data=request.data)
+        inp.is_valid(raise_exception=True)
+        remarks = inp.validated_data.get("remarks", "")
+        try:
+            app = review_duty_resumption(
+                application_id=pk,
+                reviewer_user_id=_principal_user_id(request),
+                remarks=remarks,
+            )
+        except ValueError as err:
+            return Response({"detail": str(err)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(s.LeaveApplicationSerializer(app).data)
+
+
+class OfflineLeaveCreateListView(generics.ListCreateAPIView):
+    serializer_class = s.LeaveApplicationSerializer
+    permission_classes = [
+        MODULE_GATE,
+        HasPermission("leave_elm.offline.record"),
+    ]
+
+    def get_queryset(self):
+        return LeaveApplication.objects.filter(is_offline=True).select_related("leave_type")
+
+    def create(self, request, *args, **kwargs):
+        inp = s.OfflineLeaveCreateSerializer(data=request.data)
+        inp.is_valid(raise_exception=True)
+        data = inp.validated_data
+        try:
+            app = record_offline_sanctioned_leave(
+                user_id=data["user_id"],
+                leave_type_code=data["leave_type_code"],
+                start_date=data["start_date"],
+                end_date=data["end_date"],
+                sanction_reference=data["sanction_reference"],
+                sanction_date=data["sanction_date"],
+                sanction_authority_name=data["sanction_authority_name"],
+                reason=data.get("reason", ""),
+                recorder_user_id=_principal_user_id(request),
+            )
+        except ValueError as err:
+            return Response({"detail": str(err)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(s.LeaveApplicationSerializer(app).data, status=status.HTTP_201_CREATED)
+
+
+class LeaveRolloverExecuteView(APIView):
+    serializer_class = s.LeaveRolloverExecuteSerializer
+    permission_classes = [
+        MODULE_GATE,
+        HasPermission("leave_elm.rollover.execute"),
+    ]
+
+    def post(self, request):
+        inp = s.LeaveRolloverExecuteSerializer(data=request.data)
+        inp.is_valid(raise_exception=True)
+        target_year = inp.validated_data["target_year"]
+        try:
+            records = execute_year_end_rollover(
+                target_year=target_year,
+                executor_user_id=_principal_user_id(request),
+            )
+        except ValueError as err:
+            return Response({"detail": str(err)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(
+            s.LeaveRolloverRecordSerializer(records, many=True).data,
+            status=status.HTTP_200_OK,
+        )
 
 
 class HolidayCalendarListView(generics.ListAPIView):

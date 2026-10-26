@@ -22,6 +22,36 @@ urlpatterns = [
         name="elm-substitute-respond",
     ),
     path(
+        "applications/<int:pk>/replace-substitute",
+        views.SubstituteReplacementView.as_view(),
+        name="elm-substitute-replace",
+    ),
+    path(
+        "applications/<int:pk>/cancel",
+        views.LeaveCancellationRequestView.as_view(),
+        name="elm-application-cancel",
+    ),
+    path(
+        "applications/<int:pk>/cancel/decide",
+        views.LeaveCancellationDecisionView.as_view(),
+        name="elm-cancellation-decide",
+    ),
+    path(
+        "applications/<int:pk>/extend",
+        views.LeaveExtensionCreateView.as_view(),
+        name="elm-application-extend",
+    ),
+    path(
+        "applications/<int:pk>/resumption",
+        views.DutyResumptionSubmitView.as_view(),
+        name="elm-duty-resumption-submit",
+    ),
+    path(
+        "applications/<int:pk>/resumption/decide",
+        views.DutyResumptionReviewView.as_view(),
+        name="elm-duty-resumption-decide",
+    ),
+    path(
         "approvals",
         views.LeaveApprovalQueueView.as_view(),
         name="elm-approvals",
@@ -30,6 +60,16 @@ urlpatterns = [
         "approvals/<int:pk>/decide",
         views.LeaveApprovalDecisionView.as_view(),
         name="elm-approval-decide",
+    ),
+    path(
+        "offline-leaves",
+        views.OfflineLeaveCreateListView.as_view(),
+        name="elm-offline-leaves",
+    ),
+    path(
+        "rollover",
+        views.LeaveRolloverExecuteView.as_view(),
+        name="elm-rollover-execute",
     ),
     path(
         "calendar",

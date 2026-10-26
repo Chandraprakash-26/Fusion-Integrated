@@ -231,6 +231,10 @@ SPECTACULAR_SETTINGS = {
     "DESCRIPTION": "Non-academic platform. Independent modules, one login.",
     "VERSION": "1.0.0",
     "SERVE_INCLUDE_SCHEMA": False,
+    "ENUM_NAME_OVERRIDES": {
+        "SubstituteDecisionEnum": ["accepted", "declined"],
+        "ReviewDecisionEnum": ["recommended", "not_recommended", "approved", "rejected"],
+    },
 }
 
 CORS_ALLOW_ALL_ORIGINS = False
